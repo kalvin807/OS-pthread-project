@@ -43,7 +43,7 @@
             "type": "cppdbg",
             "request": "launch",
             "program": "${fileDirname}/${fileBasenameNoExtension}",
-            "args": ["3", "3", "5"],
+            "args": ["16", "50", "10"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],

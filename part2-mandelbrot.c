@@ -2,8 +2,8 @@
 * Filename: part2-mandelbrot.c
 * Student name: Leung Chun Yin
 * Student no.: 3035437939
-* Date: Nov 19, 2019
-* version: 1.0
+* Date: Nov 24, 2019
+* version: 1.5
 * Development platform: Course VM VB6 (Tested on workbench2)
 * Compilation: gcc -pthread part2-mandelbrot.c -o 2mandel -l SDL2 -l m
 *************************************************************/
@@ -13,10 +13,8 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/types.h>
 #include <sys/time.h>
 #include <sys/resource.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -24,196 +22,152 @@
 #include "Mandel.h"
 #include "draw.h"
 
-// Create pipe fds
-int pData[2];
+// Global variables
+int task_size; // Size of a task i.e num_of_rows
+int next_line; // Next starting line of a task
+int pool_size; // Size of the task pool
+float *pixels; // Array of storing pixels of the result image
 
 typedef struct task
-{ // Create struct for task
-	int start_row;
-	int num_of_rows;
+{					 // Struct of a task
+	int start_row;   // The starting row of this task
+	int num_of_rows; // Number of row need to work in this task
 } TASK;
 
-typedef struct message
-{ // Create struct for message
-	int row_index;
-	pid_t child_pid;
-	float rowdata[IMAGE_WIDTH];
-} MSG;
-
-typedef struct msgpool
-{
-	int busy;
-	MSG *pool;
-	size_t len;					// number of items in the buffer
-	pthread_mutex_t mutex;		// needed to add/remove data from the buffer
-	pthread_cond_t can_produce; // signaled when items are removed
-} MSG_P;
-
 typedef struct taskpool
-{
-	int task_size;
-	int pool_size;
-	int next_line;
-	TASK *pool; // the buffer
-	MSG_P *msg_pool;
-	size_t len;					// number of items in the buffer
-	pthread_mutex_t mutex;		// needed to add/remove data from the buffer
-	pthread_cond_t can_produce; // signaled when items are removed
-	pthread_cond_t can_consume; // signaled when items are added
+{								// Struct of a task pool
+	int production_ends;		// Indicator of all tasks are dispatched
+	int worker_id;				// Id of next thread id
+	int *task_count;			// Array to store finished task's count of each thread
+	TASK **pool;				// Task pool
+	size_t len;					// Number of items in the pool
+	pthread_mutex_t mutex;		// Mutex Lock for add/remove data from the pool
+	pthread_cond_t can_produce; // Signaled when items are removed
+	pthread_cond_t can_consume; // Signaled when items are added
 } TASK_P;
 
-MSG *create_msg(int row)
-{ // Helper function to create a MSG struct and return its pointer
-	printf("Child (%d): Creating line %d ...\n", getpid(), row);
-	MSG *msg = (MSG *)malloc(sizeof *msg);
-	msg->row_index = row;
+void write_row(int row)
+{ // Helper function to write 1 row of pixel
+	int base = row * IMAGE_WIDTH;
 	for (int x = 0; x < IMAGE_WIDTH; x++)
 	{
-		// Compute a value for each point c (x, y) in the complex plane
-		msg->rowdata[x] = Mandelbrot(x, msg->row_index);
+		pixels[base + x] = Mandelbrot(x, row);
 	}
-	return msg;
 }
 
-TASK *create_task(int *start_row, int task_size)
-{												// Helper function to create a TASK struct and return its pointer
-	TASK *task = (TASK *)malloc(sizeof(*task)); // Collect finshed message from pipe
-	task->start_row = *start_row;
+TASK *create_task(int *next_line, int task_size)
+{ // Helper function to create a TASK struct and return its pointer
+	TASK *task = (TASK *)malloc(sizeof(*task));
+	task->start_row = *next_line;
+	// Check this task will over done the required Image height or not
+	task_size = task_size > (IMAGE_HEIGHT - *next_line) ? (IMAGE_HEIGHT - *next_line) : task_size;
 	task->num_of_rows = task_size;
-	*start_row += task_size;
+	*next_line += task_size;
 	return task;
 }
 
+// Boss thread to produce task
 void *producer(void *arg)
 {
+	int can_exit = 0;
 	TASK_P *t_pool = (TASK_P *)arg;
 	while (1)
 	{
+		TASK *new_task;
 		//---------------------Atomic Operation---------------------//
+		// Get the pool lock
 		pthread_mutex_lock(&t_pool->mutex);
 
-		if (t_pool->len == t_pool->pool_size)
-		{ // full
-			// wait until some task are consumed
+		if (t_pool->len == pool_size)
+		{ // Full
+			// Wait until some task are consumed
 			pthread_cond_wait(&t_pool->can_produce, &t_pool->mutex);
 		}
 
-		TASK *new_task;
-
-		int task_size = (t_pool->next_line + t_pool->task_size >= IMAGE_HEIGHT) ? IMAGE_HEIGHT - t_pool->next_line : t_pool->task_size;
-
-		// Create a new task ( next_line = -1 to hint worker all task dispatched )
-		// End producer thread if all task dispatched
-		if (t_pool->next_line >= IMAGE_HEIGHT)
-		{
-			t_pool->next_line = -1;
+		// Check wheather all task is dispatched
+		if (next_line >= IMAGE_HEIGHT)
+		{ // production_ends = 1 to hint worker all task dispatched
+			t_pool->production_ends = 1;
+			can_exit = 1;
 		}
 		else
-		{
-			new_task = create_task(&t_pool->next_line, task_size);
-			// append data to the task pool
-			t_pool->pool[t_pool->len] = *new_task;
+		{ // Create a new task
+			new_task = create_task(&next_line, task_size);
+			// Append data to the task pool
+			t_pool->pool[t_pool->len] = new_task;
 			t_pool->len++;
 		}
 
-		// signal the fact that new items may be consumed
+		// Signal that new items may be consumed
 		pthread_cond_signal(&t_pool->can_consume);
 		pthread_mutex_unlock(&t_pool->mutex);
-		// release queued task memory
-		if (t_pool->next_line < 0)
-			pthread_exit(NULL);
 		//---------------------Atomic Operation---------------------//
+		// End producer loop when all task is dispatched
+		if (can_exit == 1)
+			break;
 	}
-
-	// never reached
-	return NULL;
 }
 
-// consume random numbers
+// Worker thread to consume task
 void *consumer(void *arg)
 {
 	// Get the task pool
 	TASK_P *t_pool = (TASK_P *)arg;
-	MSG_P *m_pool = t_pool->msg_pool;
-
+	int task_count = 0;
+	int worker_id = -1;
 	while (1)
 	{
-		//---------------------Atomic Operation-------------------//
+		//---------------------Atomic Operation---------------------//
 		pthread_mutex_lock(&t_pool->mutex);
 
 		while (t_pool->len == 0)
-		{ // empty
-			// wait for new items to be appended to the buffer
-			if (t_pool->next_line < 0)
-			{
-				printf("Child (%d): Bye ...\n", getpid());
+		{ // Wait when t_pool is empty
+			// Check the production is ended or not
+			if (t_pool->production_ends == 1)
+			{ // Exit thread and write the final task count
+				t_pool->task_count[worker_id] = task_count;
 				pthread_mutex_unlock(&t_pool->mutex);
 				pthread_exit(NULL);
 			}
 			pthread_cond_wait(&t_pool->can_consume, &t_pool->mutex);
 		}
 
-		// grab data
-		--t_pool->len;
-		TASK *task = &(t_pool->pool[t_pool->len]);
+		// Set the worker id if it is not set yet(i.e id is -1)
+		if (worker_id < 0)
+		{
+			worker_id = t_pool->worker_id;
+			t_pool->worker_id++;
+		}
 
-		// signal the fact that new items may be produced
+		// Consume a task
+		--t_pool->len;
+		TASK *task = t_pool->pool[t_pool->len];
+
+		// Signal that new items may be produced
 		pthread_cond_signal(&t_pool->can_produce);
 		pthread_mutex_unlock(&t_pool->mutex);
 		//---------------------Atomic Operation---------------------//
-		// end worker thread if start_row == -1 Else consume it
-		if (task->start_row > 0)
+		// Start computing once it get the task
+		struct timespec start_compute, end_compute;
+		clock_gettime(CLOCK_MONOTONIC, &start_compute);
+		printf("Child (%d): Start the computation ...\n", worker_id);
+
+		// Write line row by row
+		for (int y = 0; y < task->num_of_rows; y++)
 		{
-			// consume a task
-
-			// Start computing
-			struct timespec start_compute, end_compute;
-			clock_gettime(CLOCK_MONOTONIC, &start_compute);
-			printf("Child (%d): Start the computation ...\n", getpid());
-
-			// Create msg row by row
-			for (int y = 0; y < task->num_of_rows; y++)
-			{
-				MSG *msg = create_msg(y + task->start_row);
-				if (y == task->num_of_rows - 1)
-					msg->child_pid = getpid();
-				else
-					msg->child_pid = -1;
-
-				//---------------------Atomic Operation---------------------//
-				pthread_mutex_lock(&m_pool->mutex);
-				while (&m_pool->busy == 1)
-				{
-					pthread_cond_wait(&m_pool->can_produce, &m_pool->mutex);
-				}
-				&m_pool->busy == 1;
-				m_pool->pool[y + task->start_row] = *msg;
-				&m_pool->busy == 0;
-				pthread_cond_signal(&m_pool->can_produce);
-				pthread_mutex_unlock(&m_pool->mutex);
-				//---------------------Atomic Operation---------------------//
-			}
-
-			// Report time usage of this computation
-			clock_gettime(CLOCK_MONOTONIC, &end_compute);
-			printf(
-				"Child (%d): ...completed. Elapse time = %.3f ms\n", getpid(),
-				(end_compute.tv_nsec - start_compute.tv_nsec) / 1000000.0 +
-					(end_compute.tv_sec - start_compute.tv_sec) * 1000.0);
+			write_row(y + task->start_row);
 		}
-
-		// Release finished tas		--t_pool->len;k memory
-		// End producer thread if all task dispatched
-		if (task->start_row < 0)
-		{
-			close(pData[1]);
-			pthread_exit(NULL);
-		}
+		task_count++;
+		// Report time usage of this computation
+		clock_gettime(CLOCK_MONOTONIC, &end_compute);
+		printf(
+			"Child (%d): ...completed. Elapse time = %.3f ms\n", worker_id,
+			(end_compute.tv_nsec - start_compute.tv_nsec) / 1000000.0 +
+				(end_compute.tv_sec - start_compute.tv_sec) * 1000.0);
 	}
-
-	// never reached
-	return NULL;
 }
+
+// Main entry of this program
 int main(int argc, char *args[])
 {
 	// Data structure to store the start and end times of the whole program
@@ -222,56 +176,15 @@ int main(int argc, char *args[])
 	// Get the start time
 	clock_gettime(CLOCK_MONOTONIC, &prog_start_time);
 
-	// Create data pipe
-	pipe(pData);
-
-	// Assign arguements to variables
+	// Assign arguements' value to global variables and initialize values
 	int worker_size = atoi(args[1]);
-	int task_size = atoi(args[2]);
-	int buffer_size = atoi(args[3]);
-
-	MSG_P m_pool = {
-		.busy = 0,
-		.pool = (MSG *)malloc(sizeof(MSG) * IMAGE_HEIGHT),
-		.len = 0,
-		.mutex = PTHREAD_MUTEX_INITIALIZER,
-		.can_produce = PTHREAD_COND_INITIALIZER,
-	};
-
-	TASK_P t_pool = {
-		.task_size = task_size,
-		.pool_size = buffer_size,
-		.next_line = 0,
-		.pool = (TASK *)malloc(sizeof(TASK) * buffer_size),
-		.msg_pool = &m_pool,
-		.len = 0,
-		.mutex = PTHREAD_MUTEX_INITIALIZER,
-		.can_produce = PTHREAD_COND_INITIALIZER,
-		.can_consume = PTHREAD_COND_INITIALIZER};
-
-	// Create thread for producer
-	pthread_t prod;
-	pthread_create(&prod, NULL, producer, (void *)&t_pool);
-
-	// Create threads array equal to the number of consumer
-	pthread_t cons[worker_size];
-	for (int i = 0; i < worker_size; i++)
-	{
-		pthread_create(&cons[i], NULL, consumer, (void *)&t_pool);
-	}
-
-	// Wait for the producer thread
-	pthread_join(prod, NULL);
-	// Wait for all consumer threads
-	for (int i = 0; i < worker_size; i++)
-	{
-		pthread_join(cons[i], NULL);
-	}
+	task_size = atoi(args[2]);
+	pool_size = atoi(args[3]);
+	next_line = 0;
 
 	// Generate mandelbrot image and store each pixel for later display
 	// Each pixel is represented as a value in the range of [0,1]
 	// Store the 2D image as a linear array of pixels (in row-major format)
-	float *pixels;
 	// Allocate memory to store the pixels
 	pixels = (float *)malloc(sizeof(float) * IMAGE_WIDTH * IMAGE_HEIGHT);
 	if (pixels == NULL)
@@ -279,70 +192,64 @@ int main(int argc, char *args[])
 		printf("Out of memory!!\n");
 		exit(1);
 	}
+	// Create a task pool structure and initialize its values
+	TASK_P t_pool = {
+		.production_ends = 0, // Default is false
+		.worker_id = 0,		  // First worker is id 0
+		.task_count = malloc(sizeof(int) * worker_size),
+		.pool = malloc(sizeof(TASK) * pool_size),
+		.len = 0,
+		.mutex = PTHREAD_MUTEX_INITIALIZER,
+		.can_produce = PTHREAD_COND_INITIALIZER,
+		.can_consume = PTHREAD_COND_INITIALIZER};
 
-	// Collect finshed message from pipe
-	// Close unused pipe end
-	close(pData[1]);
-
-	// Counter of collection progress
-	int recieved_rows = 0;
-
-	// MSG buffer for reading data from pipe
-	MSG *msg = (MSG *)malloc(sizeof(*msg));
-
-	while (recieved_rows < IMAGE_HEIGHT)
-	{ // When not all rows recieved
-		msg = &(m_pool.pool[recieved_rows]);
-		// Copy recieved rowdata to corrsponding section
-		memcpy(&pixels[msg->row_index * IMAGE_WIDTH],
-			   msg->rowdata,
-			   IMAGE_WIDTH * sizeof(float));
-		recieved_rows++;
+	// Create threads array equal to the number of worker
+	pthread_t cons[worker_size];
+	for (int i = 0; i < worker_size; i++)
+	{
+		pthread_create(&cons[i], NULL, consumer, (void *)&t_pool);
 	}
 
-	/*for (int i = 0; i < childsize; i++)
-	{ // Display child counter result.
+	// Start the producer in current thread
+	producer(&t_pool);
+
+	// Wait for all consumer threads
+	for (int i = 0; i < worker_size; i++)
+	{
+		pthread_join(cons[i], NULL);
+	}
+
+	for (int i = 0; i < worker_size; i++)
+	{ // Display thread task counter result.
 		printf(
-			"Child progess %d terminated and completed %d tasks.\n",
-			pid_array[0][i],
-			pid_array[1][i]);
+			"Worker thread %d has terminated and completed %d tasks.\n", i, t_pool.task_count[i]);
 	}
-	printf("All Child progesses have completed\n");
-	
+
+	printf("All worker threads have terminated\n");
+
 	// Report timing
-	struct rusage child_usage, self_usage;
-	if (getrusage(RUSAGE_CHILDREN, &child_usage) == -1)
-		printf("Get child time usage error");
-
-	printf(
-		"Total time spent by all child progesses in user mode = %.3f ms\n",
-		child_usage.ru_utime.tv_usec / 1000000.0 +
-			child_usage.ru_utime.tv_sec * 1000.0);
-	printf(
-		"Total time spent by all child progesses in system mode = %.3f ms\n",
-		child_usage.ru_stime.tv_usec / 1000000.0 +
-			child_usage.ru_stime.tv_sec * 1000.0);
-
-	if (getrusage(RUSAm_poolGE_SELF, &self_usage) == -1)
+	struct rusage usage;
+	if (getrusage(RUSAGE_SELF, &usage) == -1)
 		printf("Get self time usage error");
 
 	printf(
-		"Total time spent by parent progess in user mode = %.3f ms\n",
-		self_usage.ru_utime.tv_usec / 1000000.0 +
-			self_usage.ru_utime.tv_sec * 1000.0);
+		"Total time spent by the process and its thread in user mode = %.3f ms\n",
+		usage.ru_utime.tv_usec / 1000000.0 +
+			usage.ru_utime.tv_sec * 1000.0);
 	printf(
-		"Total time spent by parent progess in system mode = %.3f ms\n",
-		self_usage.ru_stime.tv_usec / 1000000.0 +
-			self_usage.ru_stime.tv_sec * 1000.0);
+		"Total time spent by the process and its thread in system mode = %.3f ms\n",
+		usage.ru_stime.tv_usec / 1000000.0 +
+			usage.ru_stime.tv_sec * 1000.0);
 
 	clock_gettime(CLOCK_MONOTONIC, &prog_end_time);
+
 	printf(
-		"Total elapse time measured by parent progess = %.3f ms\n",
+		"Total elapse time measured by the process = %.3f ms\n",
 		(prog_end_time.tv_nsec - prog_start_time.tv_nsec) / 1000000.0 +
 			(prog_end_time.tv_sec - prog_start_time.tv_sec) * 1000.0);
-	*/
-	printf("Draw the image\n");
+
 	// Draw the image by using the SDL2 library
+	printf("Draw the image\n");
 	DrawImage(pixels, IMAGE_WIDTH, IMAGE_HEIGHT, "Mandelbrot demo", 3000);
 	free(pixels);
 
